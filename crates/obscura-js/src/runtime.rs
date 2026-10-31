@@ -1196,6 +1196,12 @@ impl ObscuraJsRuntime {
     pub fn has_pending_frame_tasks(&self) -> bool {
         let state = self.state.borrow();
         !state.pending_frames.is_empty() || !state.pending_frame_messages.is_empty()
+            || self.realm_states().borrow().has_pending_navigation()
+    }
+
+    #[doc(hidden)]
+    pub fn take_pending_frame_navigations(&self) -> Vec<(u32, String, String, String)> {
+        self.realm_states().borrow().take_pending_navigations()
     }
 
     /// postMessage traffic waiting to be delivered to another realm.
@@ -2580,13 +2586,19 @@ impl ObscuraJsRuntime {
             .has_live_image_outcome(url, profile)
     }
 
+    #[doc(hidden)]
+    pub fn set_frame_preload_scripts(&self, scripts: &[String]) {
+        self.realm_states().borrow_mut().frame_preload_scripts = scripts.to_vec();
+    }
+
     /// Run __obscura_init() after all per-page properties (UA, platform, stealth, etc.)
     /// have been set. Must be called once per page setup, after all set_* methods.
     pub fn run_page_init(&mut self) {
         self.state.borrow_mut().navigation_timing.record("domLoading");
-        let _ = self.execute_runtime_script(
+        let _ = self.execute_script_with_timeout(
             "<obscura:page-init>",
-            "globalThis.__obscura_init();".to_string(),
+            "globalThis.__obscura_init();",
+            std::time::Duration::from_secs(5),
         );
     }
 
@@ -3766,8 +3778,8 @@ impl ObscuraJsRuntime {
             return Err("JavaScript heap limit exceeded; execution terminated".into());
         }
 
-        // Publish settled protocol replies before parking on unrelated page work.
-        if self.has_ready_cdp_evaluations() { return Ok(false); }
+        // Let the page adopt frame documents and deliver messages before parking.
+        if self.has_ready_cdp_evaluations() || self.has_pending_frame_tasks() { return Ok(false); }
 
         let isolate_handle = self.isolate_handle();
         let mut waiting_for_wake = false;
@@ -3787,7 +3799,7 @@ impl ObscuraJsRuntime {
                     "autonomous browser task exceeded its task budget".into(),
                 ));
             }
-            if self.has_ready_cdp_evaluations() {
+            if self.has_ready_cdp_evaluations() || self.has_pending_frame_tasks() {
                 return std::task::Poll::Ready(Ok(false));
             }
             match tick {
@@ -6307,6 +6319,47 @@ mod tests {
             "worker.terminate(); URL.revokeObjectURL(url);",
         )
         .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_scope_exposes_builtins_as_properties() {
+        // Go's wasm_exec uses `self` as its global object and reads
+        // self.Object / self.Promise / self.JSON; an undefined one makes the
+        // wasm panic with "call of Value.Invoke on undefined".
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "worker-scope-builtins",
+            r#"
+            globalThis.__workerReplies = [];
+            const source = `
+                const names = ['Object', 'Array', 'Promise', 'JSON', 'Uint8Array', 'Date', 'Reflect', 'WebAssembly', 'Headers', 'AbortController'];
+                postMessage({
+                    missing: names.filter(n => typeof self[n] === 'undefined'),
+                    viaGlobalThis: names.filter(n => typeof globalThis[n] === 'undefined'),
+                    sameObject: self.Object === Object && self.Promise === Promise,
+                    globalThisIsSelf: globalThis === self,
+                    noDocument: typeof self.document === 'undefined' && typeof self.window === 'undefined',
+                    callable: self.JSON.stringify(new self.Promise(() => {}) instanceof self.Promise),
+                });
+            `;
+            const url = URL.createObjectURL(new Blob([source], { type: 'application/javascript' }));
+            const worker = new Worker(url);
+            worker.onmessage = event => {
+                __workerReplies.push(event.data);
+                worker.terminate();
+                URL.revokeObjectURL(url);
+            };
+        "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__workerReplies").unwrap(),
+            serde_json::json!([{
+                "missing": [], "viaGlobalThis": [], "sameObject": true,
+                "globalThisIsSelf": true, "noDocument": true, "callable": "true",
+            }])
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
