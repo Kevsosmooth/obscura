@@ -1401,6 +1401,7 @@ fn note_compound_dependencies(
                                 InvalidationReaches::CONSERVATIVE,
                                 rule_order,
                                 !inside_relational,
+                                None,
                             );
                         }
                     }
